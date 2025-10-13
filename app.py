@@ -6,8 +6,15 @@ from pydantic import BaseModel, Field
 import httpx
 
 # --- Config ---
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")  # set in HF Spaces Secrets
-GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+# Ротация по моделям v1 (можешь менять порядок приоритетов)
+GEMINI_ENDPOINTS = [
+    "https://generativelanguage.googleapis.com/v1/models/gemini-2.5-flash:generateContent",
+    "https://generativelanguage.googleapis.com/v1/models/gemini-2.0-flash-001:generateContent",
+    "https://generativelanguage.googleapis.com/v1/models/gemini-2.0-flash-lite-001:generateContent",
+    "https://generativelanguage.googleapis.com/v1/models/gemini-2.5-flash-lite:generateContent",
+]
+DISABLE_SAFETY = os.getenv("DISABLE_SAFETY", "0") == "1"
 
 # --- FastAPI ---
 app = FastAPI(title="TextSense API", version="1.0.0")
@@ -71,14 +78,12 @@ ANALYTICS = {
 
 # --- Prompt template ---
 PROMPT_TEMPLATE = """You are an AI assistant that helps craft short, natural-sounding messenger replies.
-
 Context:
 - Relationship type: {relationship}
 - Scenario/goal: {scenario}
 - Desired tone: {tone}
 - Target gender (if any): {target_gender}
 - Personalness (0=formal, 100=very personal): {personalness}
-
 Rules:
 - Reply in the SAME LANGUAGE as the conversation{lang_hint}.
 - Max 2–3 sentences. Sound human, not robotic.
@@ -88,12 +93,9 @@ Rules:
   1) Confident & clear
   2) Friendly & warm
   3) Original with a tasteful twist (playful/flirty/clever—if appropriate)
-
 Intensity adjuster: {intensify_note}
-
 Recent conversation (latest last):
 {formatted}
-
 Return ONLY a JSON with keys: language (iso guess) and options=[{{"label": "...","text": "..."}}, ...].
 """
 
@@ -126,26 +128,34 @@ def build_prompt(payload: GenerateRequest) -> str:
 async def call_gemini(prompt: str) -> dict:
     if not GEMINI_API_KEY:
         raise HTTPException(status_code=500, detail="Missing GEMINI_API_KEY")
+
     body = {
-        "contents": [
-            {"role": "user", "parts": [{"text": prompt}]}
-        ],
+        "contents": [ { "role": "user", "parts": [ { "text": prompt } ] } ],
         "generationConfig": {
             "temperature": 0.9, "topP": 0.95, "topK": 40, "maxOutputTokens": 512
-        },
-        "safetySettings": [
-            {"category": "HARM_CATEGORY_HATE_SPEECH",      "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
-            {"category": "HARM_CATEGORY_HARASSMENT",        "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
-            {"category": "HARM_CATEGORY_SEXUAL",            "threshold": "BLOCK_MEDIUM_AND_ABOVE"},  # <-- фикс
-            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
-        ],
+        }
     }
-    url = f"{GEMINI_URL}?key={GEMINI_API_KEY}"
+
+    # Корректные safety для v1 (можно отключить через DISABLE_SAFETY=1)
+    if not DISABLE_SAFETY:
+        body["safetySettings"] = [
+            {"category": "HARM_CATEGORY_HATE_SPEECH",       "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
+            {"category": "HARM_CATEGORY_HARASSMENT",         "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
+            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT",  "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
+            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT",  "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
+            {"category": "HARM_CATEGORY_CIVIC_INTEGRITY",    "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
+        ]
+
+    # Ротация по моделям до первого успешного ответа
+    last_err = None
     async with httpx.AsyncClient(timeout=30.0) as client:
-        r = await client.post(url, json=body)
-        if r.status_code >= 400:
-            raise HTTPException(status_code=502, detail=f"Gemini error: {r.text}")
-        return r.json()
+        for url_base in GEMINI_ENDPOINTS:
+            url = f"{url_base}?key={GEMINI_API_KEY}"
+            r = await client.post(url, json=body)
+            if 200 <= r.status_code < 300:
+                return r.json()
+            last_err = r.text
+    raise HTTPException(status_code=502, detail=f"Gemini error: {last_err}")
 
 def extract_json_text(gemini_json: dict) -> str:
     # Gemini returns text in candidates[0].content.parts[*].text
